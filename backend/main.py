@@ -10,7 +10,7 @@ import math
 import av
 import numpy as np
 
-app = FastAPI(title="ActaAI Audio API", version="0.4.0")
+app = FastAPI(title="ActaAI Audio API", version="0.4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,27 @@ MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_LIVE_CHUNK_MB = int(os.getenv("MAX_LIVE_CHUNK_MB", "40"))
 MAX_LIVE_CHUNK_BYTES = MAX_LIVE_CHUNK_MB * 1024 * 1024
-ALLOWED_UPLOADS = {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm"}
+ALLOWED_UPLOADS = {
+    ".mp3", ".wav", ".m4a", ".m4b", ".mp4", ".mp4a", ".aac", ".caf",
+    ".ogg", ".flac", ".webm", ".3gp", ".3g2", ".mov"
+}
+MIME_SUFFIXES = {
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/x-aac": ".aac",
+    "audio/x-caf": ".caf",
+    "audio/caf": ".caf",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/webm": ".webm",
+}
 model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
 
 STOPWORDS = {
@@ -43,10 +63,22 @@ def health():
     return {
         "ok": True,
         "service": "actaai-audio",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "max_upload_mb": MAX_UPLOAD_MB,
         "live_transcription": True,
+        "apple_mpeg4_audio": True,
     }
+
+
+def resolve_suffix(file: UploadFile, default: str = ".m4a"):
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix in ALLOWED_UPLOADS:
+        return suffix
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    mapped = MIME_SUFFIXES.get(content_type)
+    if mapped:
+        return mapped
+    return default if not suffix else suffix
 
 
 def decode_audio(path: str, sample_rate: int = 16000):
@@ -223,7 +255,7 @@ def transcribe_file(path: Path, with_speakers: bool = False):
 
 @app.post("/transcribe-live")
 async def transcribe_live(file: UploadFile = File(...)):
-    suffix = Path(file.filename or "live.webm").suffix.lower() or ".webm"
+    suffix = resolve_suffix(file, ".webm")
     if suffix not in ALLOWED_UPLOADS:
         suffix = ".webm"
     target = UPLOADS / f"live-{uuid.uuid4()}{suffix}"
@@ -246,9 +278,10 @@ async def transcribe_live(file: UploadFile = File(...)):
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    suffix = Path(file.filename or "").suffix.lower()
+    suffix = resolve_suffix(file)
     if suffix not in ALLOWED_UPLOADS - {".webm"}:
-        raise HTTPException(status_code=400, detail="Formato no soportado")
+        content_type = file.content_type or "desconocido"
+        raise HTTPException(status_code=400, detail=f"Formato no soportado ({suffix or 'sin extensión'}, {content_type})")
     target = UPLOADS / f"{uuid.uuid4()}{suffix}"
     try:
         await save_upload(file, target, MAX_UPLOAD_BYTES)
