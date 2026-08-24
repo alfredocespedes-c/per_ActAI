@@ -11,12 +11,12 @@ import math
 import av
 import numpy as np
 
-app = FastAPI(title="ActaAI Audio API", version="0.3.0")
+app = FastAPI(title="ActaAI Audio API", version="0.3.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://alfredocespedes-c.github.io", "http://localhost:5173"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -36,7 +36,7 @@ STOPWORDS = {
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "actaai-audio", "version": "0.3.0"}
+    return {"ok": True, "service": "actaai-audio", "version": "0.3.1"}
 
 
 def decode_audio(path: str, sample_rate: int = 16000):
@@ -114,33 +114,36 @@ def cluster_score(features, labels):
 def estimate_speakers(path, segments):
     if len(segments) < 3:
         return [0] * len(segments)
-    audio = decode_audio(path)
-    feats = []
-    for seg in segments:
-        a = max(0, int(seg["start"] * 16000))
-        b = min(len(audio), int(seg["end"] * 16000))
-        feats.append(voice_features(audio[a:b]))
-    x = np.asarray(feats)
-    mu, sd = x.mean(axis=0), x.std(axis=0) + 1e-6
-    x = (x - mu) / sd
-    best_labels = np.zeros(len(x), dtype=int)
-    best_score = -1
-    max_k = min(4, max(2, len(x) // 3))
-    for k in range(2, max_k + 1):
-        labels = kmeans(x, k)
-        score = cluster_score(x, labels)
-        if score > best_score:
-            best_score, best_labels = score, labels
-    if best_score < 0.08:
-        return [0] * len(x)
-    remap, nxt = {}, 0
-    out = []
-    for lab in best_labels.tolist():
-        if lab not in remap:
-            remap[lab] = nxt
-            nxt += 1
-        out.append(remap[lab])
-    return out
+    try:
+        audio = decode_audio(path)
+        feats = []
+        for seg in segments:
+            a = max(0, int(seg["start"] * 16000))
+            b = min(len(audio), int(seg["end"] * 16000))
+            feats.append(voice_features(audio[a:b]))
+        x = np.asarray(feats)
+        mu, sd = x.mean(axis=0), x.std(axis=0) + 1e-6
+        x = (x - mu) / sd
+        best_labels = np.zeros(len(x), dtype=int)
+        best_score = -1
+        max_k = min(4, max(2, len(x) // 3))
+        for k in range(2, max_k + 1):
+            labels = kmeans(x, k)
+            score = cluster_score(x, labels)
+            if score > best_score:
+                best_score, best_labels = score, labels
+        if best_score < 0.08:
+            return [0] * len(x)
+        remap, nxt = {}, 0
+        out = []
+        for lab in best_labels.tolist():
+            if lab not in remap:
+                remap[lab] = nxt
+                nxt += 1
+            out.append(remap[lab])
+        return out
+    except Exception:
+        return [0] * len(segments)
 
 
 def tokenize(text):
@@ -169,20 +172,14 @@ def extract_topics(text, limit=6):
 
 
 def extract_agreements(segments):
-    patterns = [
-        r"\b(hay que|tenemos que|tengo que|debe|debemos|deberíamos|necesitamos|voy a|me encargo|acordamos|queda pendiente|vamos a)\b"
-    ]
+    patterns = [r"\b(hay que|tenemos que|tengo que|debe|debemos|deberíamos|necesitamos|voy a|me encargo|acordamos|queda pendiente|vamos a)\b"]
     due_re = re.compile(r"\b(hoy|mañana|lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo|esta semana|próxima semana|proxima semana|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b", re.I)
     out = []
     for s in segments:
         txt = s["text"].strip()
         if any(re.search(p, txt, re.I) for p in patterns):
             due = due_re.search(txt)
-            out.append({
-                "text": txt,
-                "owner": s["speaker"],
-                "due": due.group(0) if due else "Sin fecha detectada",
-            })
+            out.append({"text": txt, "owner": s["speaker"], "due": due.group(0) if due else "Sin fecha detectada"})
     return out[:12]
 
 
@@ -205,22 +202,18 @@ async def analyze(file: UploadFile = File(...)):
         for seg, label in zip(segments, labels):
             seg["speaker"] = f"Hablante {label + 1}"
         full_text = " ".join(s["text"] for s in segments)
-        speaker_count = len(set(labels)) if labels else 0
-        summary = build_summary(segments)
-        topics = extract_topics(full_text)
-        agreements = extract_agreements(segments)
         return {
             "status": "completed",
             "filename": file.filename,
             "language": info.language,
             "language_probability": round(info.language_probability, 4),
             "duration": round(info.duration, 2),
-            "speakers": speaker_count,
+            "speakers": len(set(labels)) if labels else 0,
             "segments": segments,
             "transcript": full_text,
-            "summary": summary,
-            "topics": topics,
-            "agreements": agreements,
+            "summary": build_summary(segments),
+            "topics": extract_topics(full_text),
+            "agreements": extract_agreements(segments),
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error procesando audio: {exc}")
