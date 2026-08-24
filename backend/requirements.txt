@@ -1,6 +1,4 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 python-multipart==0.0.20
-# Activar para procesamiento real:
-# faster-whisper
-# pyannote.audio
+faster-whisper==1.1.1
