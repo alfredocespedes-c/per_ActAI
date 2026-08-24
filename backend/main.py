@@ -5,13 +5,12 @@ from pathlib import Path
 from collections import Counter
 import os
 import re
-import shutil
 import uuid
 import math
 import av
 import numpy as np
 
-app = FastAPI(title="ActaAI Audio API", version="0.3.1")
+app = FastAPI(title="ActaAI Audio API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,6 +24,11 @@ UPLOADS = Path("uploads")
 UPLOADS.mkdir(exist_ok=True)
 MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
 COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_LIVE_CHUNK_MB = int(os.getenv("MAX_LIVE_CHUNK_MB", "40"))
+MAX_LIVE_CHUNK_BYTES = MAX_LIVE_CHUNK_MB * 1024 * 1024
+ALLOWED_UPLOADS = {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac", ".webm"}
 model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
 
 STOPWORDS = {
@@ -36,7 +40,13 @@ STOPWORDS = {
 
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "actaai-audio", "version": "0.3.1"}
+    return {
+        "ok": True,
+        "service": "actaai-audio",
+        "version": "0.4.0",
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "live_transcription": True,
+    }
 
 
 def decode_audio(path: str, sample_rate: int = 16000):
@@ -183,25 +193,66 @@ def extract_agreements(segments):
     return out[:12]
 
 
+async def save_upload(file: UploadFile, target: Path, max_bytes: int):
+    written = 0
+    with target.open("wb") as out:
+        while True:
+            chunk = await file.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                raise HTTPException(status_code=413, detail=f"Archivo demasiado grande. Máximo permitido: {max_bytes // 1024 // 1024} MB")
+            out.write(chunk)
+    return written
+
+
+def transcribe_file(path: Path, with_speakers: bool = False):
+    raw_segments, info = model.transcribe(str(path), language="es", vad_filter=True, beam_size=1)
+    segments = []
+    for seg in raw_segments:
+        text = seg.text.strip()
+        if text:
+            segments.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text})
+    labels = estimate_speakers(str(path), segments) if with_speakers else [0] * len(segments)
+    for seg, label in zip(segments, labels):
+        seg["speaker"] = f"Hablante {label + 1}"
+    full_text = " ".join(s["text"] for s in segments)
+    return segments, info, labels, full_text
+
+
+@app.post("/transcribe-live")
+async def transcribe_live(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "live.webm").suffix.lower() or ".webm"
+    if suffix not in ALLOWED_UPLOADS:
+        suffix = ".webm"
+    target = UPLOADS / f"live-{uuid.uuid4()}{suffix}"
+    try:
+        await save_upload(file, target, MAX_LIVE_CHUNK_BYTES)
+        segments, info, _, full_text = transcribe_file(target, with_speakers=False)
+        return {
+            "status": "completed",
+            "language": info.language,
+            "text": full_text,
+            "segments": segments,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error transcribiendo audio en vivo: {exc}")
+    finally:
+        target.unlink(missing_ok=True)
+
+
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in {".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac"}:
+    if suffix not in ALLOWED_UPLOADS - {".webm"}:
         raise HTTPException(status_code=400, detail="Formato no soportado")
     target = UPLOADS / f"{uuid.uuid4()}{suffix}"
     try:
-        with target.open("wb") as out:
-            shutil.copyfileobj(file.file, out)
-        raw_segments, info = model.transcribe(str(target), language="es", vad_filter=True, beam_size=1)
-        segments = []
-        for seg in raw_segments:
-            text = seg.text.strip()
-            if text:
-                segments.append({"start": round(seg.start, 2), "end": round(seg.end, 2), "text": text})
-        labels = estimate_speakers(str(target), segments)
-        for seg, label in zip(segments, labels):
-            seg["speaker"] = f"Hablante {label + 1}"
-        full_text = " ".join(s["text"] for s in segments)
+        await save_upload(file, target, MAX_UPLOAD_BYTES)
+        segments, info, labels, full_text = transcribe_file(target, with_speakers=True)
         return {
             "status": "completed",
             "filename": file.filename,
@@ -215,8 +266,9 @@ async def analyze(file: UploadFile = File(...)):
             "topics": extract_topics(full_text),
             "agreements": extract_agreements(segments),
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error procesando audio: {exc}")
     finally:
-        if target.exists():
-            target.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
