@@ -3,11 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from pathlib import Path
 from collections import Counter
-import os, re, uuid, math, time, threading
-import av
-import numpy as np
+import os, re, uuid, time, threading
 
-app = FastAPI(title="ActaAI Audio API", version="0.5.0")
+app = FastAPI(title="ActaAI Audio API", version="0.6.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 UPLOADS = Path("uploads")
@@ -22,15 +20,35 @@ MAX_LIVE_CHUNK_MB = int(os.getenv("MAX_LIVE_CHUNK_MB", "40"))
 MAX_LIVE_CHUNK_BYTES = MAX_LIVE_CHUNK_MB * 1024 * 1024
 ALLOWED_UPLOADS = {".mp3", ".wav", ".m4a", ".m4b", ".mp4", ".mp4a", ".aac", ".caf", ".ogg", ".flac", ".webm", ".3gp", ".3g2", ".mov"}
 MIME_SUFFIXES = {"audio/mp4":".m4a","audio/x-m4a":".m4a","audio/m4a":".m4a","audio/aac":".aac","audio/x-aac":".aac","audio/x-caf":".caf","audio/caf":".caf","video/mp4":".mp4","video/quicktime":".mov","audio/mpeg":".mp3","audio/wav":".wav","audio/x-wav":".wav","audio/ogg":".ogg","audio/flac":".flac","audio/webm":".webm"}
-model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
+
+# Whisper is intentionally lazy-loaded. This lets FastAPI and /health start even
+# when model download/initialization is slow or fails on a small Render instance.
+_model = None
+_model_error = None
+_model_lock = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 STOPWORDS = {"para","como","pero","porque","cuando","donde","desde","hasta","sobre","entre","este","esta","estos","estas","esto","eso","esa","ese","aqui","ahi","muy","mas","menos","tambien","entonces","bueno","bien","vamos","tiene","tener","hacer","hace","hecho","hay","que","del","las","los","una","uno","unos","unas","por","con","sin","y","o","de","la","el","en","un","al","se","es","lo","le","me","te","nos","su","sus","mi","mis","ya","si"}
 
+def get_model():
+    global _model, _model_error
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is not None:
+            return _model
+        try:
+            _model_error = None
+            _model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
+            return _model
+        except Exception as exc:
+            _model_error = str(exc)
+            raise RuntimeError(f"No se pudo iniciar Whisper ({MODEL_NAME}): {exc}") from exc
+
 @app.get("/health")
 def health():
-    return {"ok":True,"service":"actaai-audio","version":"0.5.0","max_upload_mb":MAX_UPLOAD_MB,"max_chunk_mb":MAX_CHUNK_MB,"live_transcription":True,"chunked_uploads":True,"apple_mpeg4_audio":True}
+    return {"ok":True,"service":"actaai-audio","version":"0.6.0","max_upload_mb":MAX_UPLOAD_MB,"max_chunk_mb":MAX_CHUNK_MB,"live_transcription":True,"chunked_uploads":True,"apple_mpeg4_audio":True,"whisper":{"model":MODEL_NAME,"compute_type":COMPUTE_TYPE,"status":"ready" if _model is not None else ("error" if _model_error else "not_loaded"),"error":_model_error}}
 
 def resolve_suffix_name(filename: str, content_type: str = "", default: str = ".m4a"):
     suffix = Path(filename or "").suffix.lower()
@@ -69,16 +87,21 @@ def extract_agreements(segments):
 
 async def save_upload(file: UploadFile, target: Path, max_bytes: int):
     written=0
-    with target.open("wb") as out:
-        while True:
-            chunk=await file.read(4*1024*1024)
-            if not chunk: break
-            written += len(chunk)
-            if written > max_bytes: raise HTTPException(status_code=413, detail=f"Archivo demasiado grande. Máximo permitido: {max_bytes//1024//1024} MB")
-            out.write(chunk)
-    return written
+    try:
+        with target.open("wb") as out:
+            while True:
+                chunk=await file.read(4*1024*1024)
+                if not chunk: break
+                written += len(chunk)
+                if written > max_bytes: raise HTTPException(status_code=413, detail=f"Archivo demasiado grande. Máximo permitido: {max_bytes//1024//1024} MB")
+                out.write(chunk)
+        return written
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
 
 def transcribe_file(path: Path):
+    model = get_model()
     raw_segments, info = model.transcribe(str(path), language="es", vad_filter=True, beam_size=1)
     segments=[]
     for seg in raw_segments:
@@ -92,7 +115,7 @@ def set_job(job_id, **values):
 
 def process_job(job_id: str, path: Path, filename: str):
     try:
-        set_job(job_id,status="processing",progress=8,message="Preparando audio…")
+        set_job(job_id,status="processing",progress=8,message="Preparando motor de transcripción…")
         segments, info = transcribe_file(path)
         set_job(job_id,progress=88,message="Generando resumen y acuerdos…")
         full_text=" ".join(s["text"] for s in segments)
@@ -160,7 +183,7 @@ async def transcribe_live(file: UploadFile=File(...)):
         segments,info=transcribe_file(target)
         return {"status":"completed","language":getattr(info,"language","es"),"text":" ".join(s["text"] for s in segments),"segments":segments}
     except HTTPException: raise
-    except Exception as exc: raise HTTPException(status_code=500,detail=f"Error transcribiendo audio en vivo: {exc}")
+    except Exception as exc: raise HTTPException(status_code=503,detail=f"Servicio de transcripción no disponible: {exc}")
     finally: target.unlink(missing_ok=True)
 
 @app.post("/analyze")
@@ -174,5 +197,5 @@ async def analyze(file: UploadFile=File(...)):
         full_text=" ".join(s["text"] for s in segments)
         return {"status":"completed","filename":file.filename,"language":getattr(info,"language","es"),"language_probability":round(getattr(info,"language_probability",0),4),"duration":round(getattr(info,"duration",0),2),"speakers":1,"segments":segments,"transcript":full_text,"summary":build_summary(segments),"topics":extract_topics(full_text),"agreements":extract_agreements(segments)}
     except HTTPException: raise
-    except Exception as exc: raise HTTPException(status_code=500,detail=f"Error procesando audio: {exc}")
+    except Exception as exc: raise HTTPException(status_code=503,detail=f"Servicio de transcripción no disponible: {exc}")
     finally: target.unlink(missing_ok=True)
