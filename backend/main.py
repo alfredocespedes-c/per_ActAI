@@ -5,27 +5,35 @@ from pathlib import Path
 from collections import Counter
 import os, re, uuid, time, threading
 
-app = FastAPI(title="ActaAI Audio API", version="0.6.0")
+app = FastAPI(title="ActaAI Audio API", version="0.7.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 UPLOADS = Path("uploads")
 UPLOADS.mkdir(exist_ok=True)
-MODEL_NAME = os.getenv("WHISPER_MODEL", "base")
+MODEL_NAME = os.getenv("WHISPER_MODEL", "large-v3-turbo")
+DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "500"))
+CPU_THREADS = int(os.getenv("WHISPER_CPU_THREADS", "0"))
+BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "3"))
+VAD_ENABLED = os.getenv("WHISPER_VAD", "true").lower() not in {"0", "false", "no"}
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "1000"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_CHUNK_MB = int(os.getenv("MAX_CHUNK_MB", "12"))
 MAX_CHUNK_BYTES = MAX_CHUNK_MB * 1024 * 1024
 MAX_LIVE_CHUNK_MB = int(os.getenv("MAX_LIVE_CHUNK_MB", "40"))
 MAX_LIVE_CHUNK_BYTES = MAX_LIVE_CHUNK_MB * 1024 * 1024
+DIARIZATION_ENABLED = os.getenv("DIARIZATION_ENABLED", "false").lower() in {"1", "true", "yes"}
+DIARIZATION_MODEL = os.getenv("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 ALLOWED_UPLOADS = {".mp3", ".wav", ".m4a", ".m4b", ".mp4", ".mp4a", ".aac", ".caf", ".ogg", ".flac", ".webm", ".3gp", ".3g2", ".mov"}
 MIME_SUFFIXES = {"audio/mp4":".m4a","audio/x-m4a":".m4a","audio/m4a":".m4a","audio/aac":".aac","audio/x-aac":".aac","audio/x-caf":".caf","audio/caf":".caf","video/mp4":".mp4","video/quicktime":".mov","audio/mpeg":".mp3","audio/wav":".wav","audio/x-wav":".wav","audio/ogg":".ogg","audio/flac":".flac","audio/webm":".webm"}
 
-# Whisper is intentionally lazy-loaded. This lets FastAPI and /health start even
-# when model download/initialization is slow or fails on a small Render instance.
 _model = None
 _model_error = None
 _model_lock = threading.Lock()
+_diarization_pipeline = None
+_diarization_error = None
+_diarization_lock = threading.Lock()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
@@ -40,15 +48,67 @@ def get_model():
             return _model
         try:
             _model_error = None
-            _model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
+            kwargs = {"device": DEVICE, "compute_type": COMPUTE_TYPE}
+            if CPU_THREADS > 0:
+                kwargs["cpu_threads"] = CPU_THREADS
+            _model = WhisperModel(MODEL_NAME, **kwargs)
             return _model
         except Exception as exc:
             _model_error = str(exc)
             raise RuntimeError(f"No se pudo iniciar Whisper ({MODEL_NAME}): {exc}") from exc
 
+def get_diarization_pipeline():
+    global _diarization_pipeline, _diarization_error
+    if not DIARIZATION_ENABLED:
+        return None
+    if _diarization_pipeline is not None:
+        return _diarization_pipeline
+    with _diarization_lock:
+        if _diarization_pipeline is not None:
+            return _diarization_pipeline
+        try:
+            from pyannote.audio import Pipeline
+            _diarization_error = None
+            kwargs = {}
+            if HF_TOKEN:
+                kwargs["token"] = HF_TOKEN
+            try:
+                _diarization_pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
+            except TypeError:
+                if HF_TOKEN:
+                    kwargs = {"use_auth_token": HF_TOKEN}
+                _diarization_pipeline = Pipeline.from_pretrained(DIARIZATION_MODEL, **kwargs)
+            return _diarization_pipeline
+        except Exception as exc:
+            _diarization_error = str(exc)
+            raise RuntimeError(f"No se pudo iniciar diarización ({DIARIZATION_MODEL}): {exc}") from exc
+
 @app.get("/health")
 def health():
-    return {"ok":True,"service":"actaai-audio","version":"0.6.0","max_upload_mb":MAX_UPLOAD_MB,"max_chunk_mb":MAX_CHUNK_MB,"live_transcription":True,"chunked_uploads":True,"apple_mpeg4_audio":True,"whisper":{"model":MODEL_NAME,"compute_type":COMPUTE_TYPE,"status":"ready" if _model is not None else ("error" if _model_error else "not_loaded"),"error":_model_error}}
+    return {
+        "ok": True,
+        "service": "actaai-audio",
+        "version": "0.7.0",
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "max_chunk_mb": MAX_CHUNK_MB,
+        "live_transcription": True,
+        "chunked_uploads": True,
+        "apple_mpeg4_audio": True,
+        "whisper": {
+            "model": MODEL_NAME,
+            "device": DEVICE,
+            "compute_type": COMPUTE_TYPE,
+            "vad": VAD_ENABLED,
+            "status": "ready" if _model is not None else ("error" if _model_error else "not_loaded"),
+            "error": _model_error,
+        },
+        "diarization": {
+            "enabled": DIARIZATION_ENABLED,
+            "model": DIARIZATION_MODEL,
+            "status": "ready" if _diarization_pipeline is not None else ("error" if _diarization_error else "not_loaded"),
+            "error": _diarization_error,
+        },
+    }
 
 def resolve_suffix_name(filename: str, content_type: str = "", default: str = ".m4a"):
     suffix = Path(filename or "").suffix.lower()
@@ -102,12 +162,51 @@ async def save_upload(file: UploadFile, target: Path, max_bytes: int):
 
 def transcribe_file(path: Path):
     model = get_model()
-    raw_segments, info = model.transcribe(str(path), language="es", vad_filter=True, beam_size=1)
+    raw_segments, info = model.transcribe(
+        str(path),
+        language="es",
+        vad_filter=VAD_ENABLED,
+        beam_size=BEAM_SIZE,
+        condition_on_previous_text=True,
+        word_timestamps=False,
+    )
     segments=[]
     for seg in raw_segments:
         text=seg.text.strip()
-        if text: segments.append({"start":round(seg.start,2),"end":round(seg.end,2),"text":text,"speaker":"Hablante 1"})
+        if text:
+            segments.append({"start":round(seg.start,2),"end":round(seg.end,2),"text":text,"speaker":"Hablante 1"})
+    if DIARIZATION_ENABLED and segments:
+        segments = apply_diarization(path, segments)
     return segments, info
+
+def apply_diarization(path: Path, segments):
+    pipeline = get_diarization_pipeline()
+    if pipeline is None:
+        return segments
+    output = pipeline(str(path))
+    annotation = getattr(output, "speaker_diarization", output)
+    turns=[]
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
+        turns.append((float(turn.start), float(turn.end), str(speaker)))
+    if not turns:
+        return segments
+    speaker_map={}
+    for seg in segments:
+        best_speaker=None
+        best_overlap=0.0
+        for start,end,speaker in turns:
+            overlap=max(0.0,min(seg["end"],end)-max(seg["start"],start))
+            if overlap>best_overlap:
+                best_overlap=overlap
+                best_speaker=speaker
+        if best_speaker is not None:
+            if best_speaker not in speaker_map:
+                speaker_map[best_speaker]=f"Hablante {len(speaker_map)+1}"
+            seg["speaker"]=speaker_map[best_speaker]
+    return segments
+
+def speaker_count(segments):
+    return len({s.get("speaker") for s in segments if s.get("speaker")}) or 1
 
 def set_job(job_id, **values):
     with JOBS_LOCK:
@@ -119,7 +218,7 @@ def process_job(job_id: str, path: Path, filename: str):
         segments, info = transcribe_file(path)
         set_job(job_id,progress=88,message="Generando resumen y acuerdos…")
         full_text=" ".join(s["text"] for s in segments)
-        result={"status":"completed","filename":filename,"language":getattr(info,"language","es"),"language_probability":round(getattr(info,"language_probability",0),4),"duration":round(getattr(info,"duration",0),2),"speakers":1,"segments":segments,"transcript":full_text,"summary":build_summary(segments),"topics":extract_topics(full_text),"agreements":extract_agreements(segments)}
+        result={"status":"completed","filename":filename,"language":getattr(info,"language","es"),"language_probability":round(getattr(info,"language_probability",0),4),"duration":round(getattr(info,"duration",0),2),"speakers":speaker_count(segments),"segments":segments,"transcript":full_text,"summary":build_summary(segments),"topics":extract_topics(full_text),"agreements":extract_agreements(segments)}
         set_job(job_id,status="completed",progress=100,message="Listo",result=result)
     except Exception as exc:
         set_job(job_id,status="failed",message=f"Error procesando audio: {exc}",error=str(exc))
@@ -180,7 +279,14 @@ async def transcribe_live(file: UploadFile=File(...)):
     target=UPLOADS/f"live-{uuid.uuid4()}{suffix}"
     try:
         await save_upload(file,target,MAX_LIVE_CHUNK_BYTES)
-        segments,info=transcribe_file(target)
+        # En vivo prioriza latencia: no ejecuta diarización pesada por fragmento.
+        global DIARIZATION_ENABLED
+        diarization_state = DIARIZATION_ENABLED
+        DIARIZATION_ENABLED = False
+        try:
+            segments,info=transcribe_file(target)
+        finally:
+            DIARIZATION_ENABLED = diarization_state
         return {"status":"completed","language":getattr(info,"language","es"),"text":" ".join(s["text"] for s in segments),"segments":segments}
     except HTTPException: raise
     except Exception as exc: raise HTTPException(status_code=503,detail=f"Servicio de transcripción no disponible: {exc}")
@@ -195,7 +301,7 @@ async def analyze(file: UploadFile=File(...)):
         await save_upload(file,target,MAX_UPLOAD_BYTES)
         segments,info=transcribe_file(target)
         full_text=" ".join(s["text"] for s in segments)
-        return {"status":"completed","filename":file.filename,"language":getattr(info,"language","es"),"language_probability":round(getattr(info,"language_probability",0),4),"duration":round(getattr(info,"duration",0),2),"speakers":1,"segments":segments,"transcript":full_text,"summary":build_summary(segments),"topics":extract_topics(full_text),"agreements":extract_agreements(segments)}
+        return {"status":"completed","filename":file.filename,"language":getattr(info,"language","es"),"language_probability":round(getattr(info,"language_probability",0),4),"duration":round(getattr(info,"duration",0),2),"speakers":speaker_count(segments),"segments":segments,"transcript":full_text,"summary":build_summary(segments),"topics":extract_topics(full_text),"agreements":extract_agreements(segments)}
     except HTTPException: raise
     except Exception as exc: raise HTTPException(status_code=503,detail=f"Servicio de transcripción no disponible: {exc}")
     finally: target.unlink(missing_ok=True)
