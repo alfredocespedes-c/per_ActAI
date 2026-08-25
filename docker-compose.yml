@@ -1,0 +1,34 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      HF_HOME: /models/huggingface
+      XDG_CACHE_HOME: /models/cache
+    volumes:
+      - whisper_models:/models
+      - uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8119}:8000"
+    restart: unless-stopped
+
+volumes:
+  whisper_models:
+  uploads:
