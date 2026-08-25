@@ -2,6 +2,6 @@ fastapi==0.116.1
 uvicorn[standard]==0.35.0
 python-multipart==0.0.20
 requests==2.32.5
-faster-whisper==1.1.1
+faster-whisper==1.2.1
 numpy<2
 av>=12,<14
