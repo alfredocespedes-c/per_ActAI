@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: per-actai-api
+    runtime: docker
+    plan: free
+    branch: feat/render-2026.08.25.1
+    autoDeployTrigger: commit
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: WHISPER_MODEL
+        value: tiny
+      - key: WHISPER_DEVICE
+        value: cpu
+      - key: WHISPER_COMPUTE_TYPE
+        value: int8
+      - key: WHISPER_BEAM_SIZE
+        value: "1"
+      - key: WHISPER_VAD
+        value: "true"
+      - key: MAX_UPLOAD_MB
+        value: "1000"
+      - key: MAX_CHUNK_MB
+        value: "8"
+      - key: MAX_LIVE_CHUNK_MB
+        value: "20"
+      - key: DIARIZATION_ENABLED
+        value: "false"
+
+  - type: web
+    name: per-actai-web
+    runtime: docker
+    plan: free
+    branch: feat/render-2026.08.25.1
+    autoDeployTrigger: commit
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: .
+    healthCheckPath: /
+    envVars:
+      - key: BACKEND_HOSTPORT
+        fromService:
+          type: web
+          name: per-actai-api
+          property: hostport
