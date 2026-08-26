@@ -38,8 +38,8 @@ services:
     dockerContext: .
     healthCheckPath: /
     envVars:
-      - key: BACKEND_HOSTPORT
+      - key: BACKEND_URL
         fromService:
           type: web
           name: per-actai-api
-          property: hostport
+          envVarKey: RENDER_EXTERNAL_URL
