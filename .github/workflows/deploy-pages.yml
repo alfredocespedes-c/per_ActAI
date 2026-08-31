@@ -2,7 +2,7 @@ name: Deploy frontend to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    branches: [feat/render-2026.08.25.1]
   workflow_dispatch:
 
 permissions:
