@@ -3,7 +3,7 @@ import {createRoot} from 'react-dom/client';
 import {Upload,FileAudio,Users,Clock3,Mic2,Search,Download,PlayCircle,AlertCircle,Mail,Edit3,CheckCircle2,Pause,Square,Copy,Radio,RotateCcw} from 'lucide-react';
 import './styles.css';
 
-const API_URL='/api';
+const API_URL='https://per-actai-api.onrender.com';
 const MAX_UPLOAD_MB=1000,MAX_UPLOAD_BYTES=MAX_UPLOAD_MB*1024*1024,LIVE_CHUNK_MS=8000;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const fmt=(seconds=0)=>{const s=Math.max(0,Math.floor(seconds)),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return h>0?`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`:`${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`};
